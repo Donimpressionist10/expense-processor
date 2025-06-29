@@ -3,7 +3,6 @@ version = 0.1
 [default.deploy]
 [default.deploy.parameters]
 stack_name = "expense-processor-stack"
-s3_bucket = "your-sam-deployment-bucket"
 s3_prefix = "expense-processor-stack"
 region = "us-east-1"
 capabilities = "CAPABILITY_IAM"

@@ -1,0 +1,60 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Transform: AWS::Serverless-2016-10-31
+Description: 'Expense Processor Lambda for SES Email Processing'
+
+Globals:
+  Function:
+    Timeout: 30
+    Runtime: java21
+    Architectures:
+      - x86_64
+    MemorySize: 512
+
+Resources:
+  ExpenseProcessorFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: expense-processor
+      CodeUri: app
+      Handler: org.finance.expenseprocessor.ExpenseProcessor::handleRequest
+      Environment:
+        Variables:
+          BUCKET_NAME: financecli-expenses-us-east-1
+      Events:
+        S3Event:
+          Type: S3
+          Properties:
+            Bucket: !Ref ExpenseBucket
+            Events: s3:ObjectCreated:*
+            Filter:
+              S3Key:
+                Rules:
+                  - Name: prefix
+                    Value: incoming/
+      Policies:
+        - S3ReadPolicy:
+            BucketName: financecli-expenses-us-east-1
+        - KMSDecryptPolicy:
+            KeyId: alias/aws/s3
+
+  ExpenseBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: financecli-expenses-us-east-1
+      NotificationConfiguration:
+        LambdaConfigurations:
+          - Event: s3:ObjectCreated:*
+            Function: !GetAtt ExpenseProcessorFunction.Arn
+            Filter:
+              S3Key:
+                Rules:
+                  - Name: prefix
+                    Value: incoming/
+
+Outputs:
+  ExpenseProcessorFunction:
+    Description: "Expense Processor Lambda Function ARN"
+    Value: !GetAtt ExpenseProcessorFunction.Arn
+  ExpenseProcessorIamRole:
+    Description: "Implicit IAM Role created for function"
+    Value: !GetAtt ExpenseProcessorFunctionRole.Arn

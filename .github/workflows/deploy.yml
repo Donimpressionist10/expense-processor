@@ -26,7 +26,7 @@ jobs:
         restore-keys: |
           ${{ runner.os }}-gradle-
     - name: Run tests
-      run: ./gradlew test
+      run: ./gradlew :app:test
       
   deploy:
     needs: test
@@ -59,7 +59,7 @@ jobs:
         restore-keys: |
           ${{ runner.os }}-gradle-
     - name: Build application
-      run: ./gradlew build
+      run: ./gradlew :app:build
     - name: SAM build
       run: sam build
     - name: SAM deploy

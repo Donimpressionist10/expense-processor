@@ -34,6 +34,8 @@ Resources:
       Policies:
         - S3ReadPolicy:
             BucketName: financecli-expenses-us-east-1
+        - S3WritePolicy:
+            BucketName: financecli-expenses-us-east-1
         - KMSDecryptPolicy:
             KeyId: alias/aws/s3
 

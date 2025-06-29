@@ -24,12 +24,16 @@ import java.util.Base64;
 import java.util.Arrays;
 import java.util.Optional;
 import java.util.stream.IntStream;
+import java.util.Set;
+import java.util.HashSet;
 import com.amazonaws.services.s3.model.ObjectMetadata;
 
 public class ExpenseProcessor implements RequestHandler<S3Event, String> {
     
     private static final Logger logger = LoggerFactory.getLogger(ExpenseProcessor.class);
     private final AmazonS3 s3Client;
+    private static final String FILTER_CONFIG_KEY = "filter-config.txt";
+    private Set<String> filterPatterns;
     
     // Java 21 record for column mapping
     public record ColumnIndices(int valueDate, int description, int amount) {
@@ -47,10 +51,12 @@ public class ExpenseProcessor implements RequestHandler<S3Event, String> {
     
     public ExpenseProcessor() {
         this.s3Client = AmazonS3ClientBuilder.defaultClient();
+        this.filterPatterns = new HashSet<>();
     }
     
     public ExpenseProcessor(AmazonS3 s3Client) {
         this.s3Client = s3Client;
+        this.filterPatterns = new HashSet<>();
     }
     
     @Override
@@ -185,20 +191,26 @@ public class ExpenseProcessor implements RequestHandler<S3Event, String> {
                 return;
             }
             
-            // Process CSV data using streams and records
+            // Load filter patterns before processing
+            loadFilterPatterns(bucketName);
+            
+            // Process CSV data using streams and records with filtering
             var expenseRecords = records.stream()
                     .skip(1) // Skip header
                     .filter(row -> row.length > Math.max(columnIndices.valueDate(), 
                                                        Math.max(columnIndices.description(), columnIndices.amount())))
-                    .map(row -> {
-                        logger.info("Processing CSV row: [{}]", String.join(", ", row));
-                        return new ExpenseRecord(
-                                row[columnIndices.valueDate()],
-                                row[columnIndices.description()],
-                                row[columnIndices.amount()]
-                        );
-                    })
+                    .map(row -> new ExpenseRecord(
+                            row[columnIndices.valueDate()],
+                            row[columnIndices.description()],
+                            row[columnIndices.amount()]
+                    ))
+                    .filter(record -> !shouldFilterRecord(record))
+                    .peek(record -> logger.info("Included CSV row: [{}, {}, {}]", 
+                                               record.valueDate(), record.description(), record.amount()))
                     .toList();
+            
+            logger.info("After filtering: {} records remaining out of {} original records", 
+                       expenseRecords.size(), records.size() - 1);
             
             // Write reduced CSV to S3
             writeReducedCsvToS3(expenseRecords, bucketName, originalObjectKey);
@@ -268,5 +280,40 @@ public class ExpenseProcessor implements RequestHandler<S3Event, String> {
             case -1, 0 -> fileName;  // No extension or starts with dot
             default -> fileName.substring(0, dotIndex);
         };
+    }
+    
+    private void loadFilterPatterns(String bucketName) {
+        try {
+            logger.info("Loading filter patterns from s3://{}/{}", bucketName, FILTER_CONFIG_KEY);
+            
+            var filterObject = s3Client.getObject(bucketName, FILTER_CONFIG_KEY);
+            try (var reader = new BufferedReader(new InputStreamReader(filterObject.getObjectContent()))) {
+                filterPatterns = reader.lines()
+                        .map(String::trim)
+                        .filter(line -> !line.isEmpty() && !line.startsWith("#"))
+                        .collect(HashSet::new, HashSet::add, HashSet::addAll);
+                
+                logger.info("Loaded {} filter patterns: {}", filterPatterns.size(), filterPatterns);
+            } finally {
+                filterObject.close();
+            }
+        } catch (Exception e) {
+            logger.warn("Could not load filter patterns from s3://{}/{}: {}. Processing without filtering.", 
+                       bucketName, FILTER_CONFIG_KEY, e.getMessage());
+            filterPatterns = new HashSet<>();
+        }
+    }
+    
+    private boolean shouldFilterRecord(ExpenseRecord record) {
+        var description = record.description().toLowerCase();
+        
+        var shouldFilter = filterPatterns.stream()
+                .anyMatch(pattern -> description.contains(pattern.toLowerCase()));
+        
+        if (shouldFilter) {
+            logger.info("Filtering out record with description: {}", record.description());
+        }
+        
+        return shouldFilter;
     }
 }

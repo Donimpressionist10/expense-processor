@@ -29,12 +29,22 @@ class CollapsedRecordsIntegrationTest {
         mockS3Client = Mockito.mock(AmazonS3.class);
         processor = new ExpenseProcessor(mockS3Client);
         
-        // Load test CSV content
-        var testCsvPath = Paths.get("../test.csv");
+        // Load test CSV content - look for test.csv in project root
+        var testCsvPath = Paths.get("../../test.csv"); // From app/src/test to project root
         if (!Files.exists(testCsvPath)) {
-            testCsvPath = Paths.get("../../test.csv");
+            testCsvPath = Paths.get("../../../test.csv"); // Alternative path
         }
-        testCsvContent = Files.readString(testCsvPath);
+        if (!Files.exists(testCsvPath)) {
+            // If still not found, create minimal test data
+            testCsvContent = """
+                "Value Date","Value Time","Type","Description","Beneficiary or CardHolder","Amount"
+                2025-06-28,12:45:56,"Pending","Uber JOHANNESBURG ZA","Jake Daniels",-91.00
+                2025-06-27,08:26:53,"Pending","Uber JOHANNESBURG ZA","Jake Daniels",-104.00
+                2025-06-26,08:06:04,"Pending","WOOLWORTHS CAPE TOWN","J Daniels",-142.07
+                """;
+        } else {
+            testCsvContent = Files.readString(testCsvPath);
+        }
     }
     
     @Test

@@ -9,6 +9,8 @@ gradle-app.setting
 !gradle/wrapper/gradle-wrapper.jar
 *.war
 *.ear
+filter-config.txt
+test.csv
 
 # AWS SAM
 .aws-sam/

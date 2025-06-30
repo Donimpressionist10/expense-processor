@@ -32,4 +32,28 @@ class ExpenseProcessorTest {
         var invalidIndices = new ExpenseProcessor.ColumnIndices(-1, 1, 2);
         assertFalse(invalidIndices.isValid());
     }
+    
+    @Test void testCollapsedExpenseRecord() {
+        var record1 = new ExpenseProcessor.ExpenseRecord("2025-06-28", "Coffee Shop", "-4.95");
+        var record2 = new ExpenseProcessor.ExpenseRecord("2025-06-29", "Coffee Shop", "-3.50");
+        
+        var collapsed = ExpenseProcessor.CollapsedExpenseRecord.fromSingle(record1);
+        assertEquals(1, collapsed.valueDates().size());
+        assertTrue(collapsed.valueDates().contains("2025-06-28"));
+        assertEquals("Coffee Shop", collapsed.description());
+        assertEquals("-4.95", collapsed.totalAmount().toString());
+        
+        var updated = collapsed.addRecord(record2);
+        assertEquals(2, updated.valueDates().size());
+        assertTrue(updated.valueDates().contains("2025-06-28"));
+        assertTrue(updated.valueDates().contains("2025-06-29"));
+        assertEquals("Coffee Shop", updated.description());
+        assertEquals("-8.45", updated.totalAmount().toString());
+        
+        String[] array = updated.toArray();
+        assertEquals(3, array.length);
+        assertEquals("2025-06-29", array[0]); // Should use latest date only
+        assertEquals("Coffee Shop", array[1]);
+        assertEquals("-8.45", array[2]);
+    }
 }

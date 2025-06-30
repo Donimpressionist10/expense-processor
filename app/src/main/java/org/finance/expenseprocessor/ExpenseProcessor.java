@@ -26,6 +26,11 @@ import java.util.Optional;
 import java.util.stream.IntStream;
 import java.util.Set;
 import java.util.HashSet;
+import java.util.Map;
+import java.util.HashMap;
+import java.util.stream.Collectors;
+import java.math.BigDecimal;
+import java.math.RoundingMode;
 import com.amazonaws.services.s3.model.ObjectMetadata;
 
 public class ExpenseProcessor implements RequestHandler<S3Event, String> {
@@ -46,6 +51,45 @@ public class ExpenseProcessor implements RequestHandler<S3Event, String> {
     public record ExpenseRecord(String valueDate, String description, String amount) {
         public String[] toArray() {
             return new String[]{valueDate, description, amount};
+        }
+        
+        public BigDecimal getAmountAsBigDecimal() {
+            try {
+                return new BigDecimal(amount);
+            } catch (NumberFormatException e) {
+                logger.warn("Could not parse amount '{}' as number, using 0.00", amount);
+                return BigDecimal.ZERO;
+            }
+        }
+    }
+    
+    // Java 21 record for collapsed expense data
+    public record CollapsedExpenseRecord(Set<String> valueDates, String description, BigDecimal totalAmount) {
+        public String[] toArray() {
+            // Always use the latest date for simplicity and cleanliness
+            var latestDate = valueDates.stream()
+                    .max(String::compareTo)
+                    .orElse("");
+            
+            return new String[]{latestDate, description, totalAmount.setScale(2, RoundingMode.HALF_UP).toString()};
+        }
+        
+        public static CollapsedExpenseRecord fromSingle(ExpenseRecord record) {
+            return new CollapsedExpenseRecord(
+                    Set.of(record.valueDate()),
+                    record.description(),
+                    record.getAmountAsBigDecimal()
+            );
+        }
+        
+        public CollapsedExpenseRecord addRecord(ExpenseRecord record) {
+            var newDates = new HashSet<>(valueDates);
+            newDates.add(record.valueDate());
+            return new CollapsedExpenseRecord(
+                    newDates,
+                    description,
+                    totalAmount.add(record.getAmountAsBigDecimal())
+            );
         }
     }
     
@@ -172,7 +216,8 @@ public class ExpenseProcessor implements RequestHandler<S3Event, String> {
         }
     }
     
-    private void processCsvContent(String csvContent, String bucketName, String originalObjectKey) throws Exception {
+    // Package-private for testing
+    void processCsvContent(String csvContent, String bucketName, String originalObjectKey) throws Exception {
         logger.info("Processing CSV content");
         
         try (var csvReader = new CSVReader(new StringReader(csvContent))) {
@@ -205,6 +250,7 @@ public class ExpenseProcessor implements RequestHandler<S3Event, String> {
                             row[columnIndices.amount()]
                     ))
                     .filter(record -> !shouldFilterRecord(record))
+                    .filter(record -> !hasPositiveAmount(record))
                     .peek(record -> logger.info("Included CSV row: [{}, {}, {}]", 
                                                record.valueDate(), record.description(), record.amount()))
                     .toList();
@@ -212,8 +258,11 @@ public class ExpenseProcessor implements RequestHandler<S3Event, String> {
             logger.info("After filtering: {} records remaining out of {} original records", 
                        expenseRecords.size(), records.size() - 1);
             
-            // Write reduced CSV to S3
-            writeReducedCsvToS3(expenseRecords, bucketName, originalObjectKey);
+            // Collapse records with same description
+            var collapsedRecords = collapseRecords(expenseRecords);
+            
+            // Write collapsed CSV to S3
+            writeCollapsedCsvToS3(collapsedRecords, bucketName, originalObjectKey);
         }
     }
     
@@ -265,7 +314,11 @@ public class ExpenseProcessor implements RequestHandler<S3Event, String> {
     
     private String generateCsvContent(List<String[]> records) throws Exception {
         try (var stringWriter = new StringWriter();
-             var csvWriter = new CSVWriter(stringWriter)) {
+             var csvWriter = new CSVWriter(stringWriter, 
+                     CSVWriter.DEFAULT_SEPARATOR, 
+                     CSVWriter.DEFAULT_QUOTE_CHARACTER,
+                     CSVWriter.DEFAULT_ESCAPE_CHARACTER,
+                     CSVWriter.DEFAULT_LINE_END)) {
             csvWriter.writeAll(records);
             return stringWriter.toString();
         }
@@ -315,5 +368,125 @@ public class ExpenseProcessor implements RequestHandler<S3Event, String> {
         }
         
         return shouldFilter;
+    }
+    
+    private boolean hasPositiveAmount(ExpenseRecord record) {
+        try {
+            var amount = record.getAmountAsBigDecimal();
+            var isPositive = amount.compareTo(BigDecimal.ZERO) > 0;
+            
+            if (isPositive) {
+                logger.info("Filtering out record with positive amount: {} ({})", 
+                           record.description(), amount);
+            }
+            
+            return isPositive;
+        } catch (Exception e) {
+            logger.warn("Could not parse amount '{}' for filtering, including record", record.amount());
+            return false;
+        }
+    }
+    
+    // Package-private for testing
+    List<CollapsedExpenseRecord> collapseRecords(List<ExpenseRecord> expenseRecords) {
+        logger.info("Collapsing {} records by description", expenseRecords.size());
+        
+        // Group by normalized description and collect into CollapsedExpenseRecord
+        var collapsedMap = expenseRecords.stream()
+                .collect(Collectors.groupingBy(record -> normalizeDescription(record.description())))
+                .entrySet().stream()
+                .collect(Collectors.toMap(
+                        Map.Entry::getKey,
+                        entry -> {
+                            var records = entry.getValue();
+                            var normalizedDescription = entry.getKey();
+                            var dates = records.stream()
+                                    .map(ExpenseRecord::valueDate)
+                                    .collect(Collectors.toSet());
+                            var totalAmount = records.stream()
+                                    .map(ExpenseRecord::getAmountAsBigDecimal)
+                                    .reduce(BigDecimal.ZERO, BigDecimal::add);
+                            
+                            return new CollapsedExpenseRecord(dates, normalizedDescription, totalAmount);
+                        }
+                ));
+        
+        var collapsedRecords = collapsedMap.values().stream()
+                .sorted((r1, r2) -> r1.description().compareToIgnoreCase(r2.description()))
+                .toList();
+        
+        logger.info("Collapsed to {} unique descriptions", collapsedRecords.size());
+        
+        // Log collapsed records for debugging
+        collapsedRecords.forEach(record -> 
+                logger.info("Collapsed record: {} | {} | {} (dates: {})", 
+                           record.description(), 
+                           record.totalAmount().setScale(2, RoundingMode.HALF_UP),
+                           record.valueDates().size() > 1 ? "COLLAPSED" : "SINGLE",
+                           String.join(", ", record.valueDates().stream().sorted().toList())
+                )
+        );
+        
+        return collapsedRecords;
+    }
+    
+    private String normalizeDescription(String description) {
+        var normalized = description.trim().toUpperCase();
+        
+        // Define normalization patterns - group similar merchants
+        var patterns = new HashMap<String, String>();
+        patterns.put("UBER", "Uber");
+        patterns.put("WOOLWORTHS", "Woolworths");
+        patterns.put("EMPACT", "Empact Amazon");
+        patterns.put("AMAZON", "Amazon");
+        patterns.put("APPLE.COM", "Apple");
+        patterns.put("ITUNES", "Apple");
+        patterns.put("STEAM", "Steam");
+        patterns.put("NINTENDO", "Nintendo");
+        patterns.put("GOOGLE", "Google");
+        patterns.put("PAYSTACK", "PayStack");
+        patterns.put("CHECKERS", "Checkers");
+        patterns.put("TAKEALO", "TakeALot");
+        patterns.put("DISCOVERY CARD PAYMENT", "Discovery Card Payment");
+        patterns.put("MONTHLY ACCOUNT FEE", "Monthly Account Fee");
+        patterns.put("VITALITY", "Vitality");
+        patterns.put("PAYFAST", "PayFast");
+        
+        // Find the first matching pattern and return the normalized name
+        for (var entry : patterns.entrySet()) {
+            if (normalized.contains(entry.getKey())) {
+                return entry.getValue();
+            }
+        }
+        
+        // For transactions without specific patterns, use the original description
+        return description;
+    }
+    
+    private void writeCollapsedCsvToS3(List<CollapsedExpenseRecord> collapsedRecords, String bucketName, String originalObjectKey) throws Exception {
+        logger.info("Writing collapsed CSV to S3");
+        
+        // Create CSV content with header + data rows
+        var allRecords = new ArrayList<String[]>();
+        allRecords.add(new String[]{"Value Dates", "Description", "Total Amount"});
+        collapsedRecords.stream()
+                .map(CollapsedExpenseRecord::toArray)
+                .forEach(allRecords::add);
+        
+        // Generate CSV content using try-with-resources
+        var csvContent = generateCsvContent(allRecords);
+        var outputKey = "processed/" + extractFileNameFromKey(originalObjectKey) + "_collapsed.csv";
+        
+        // Upload to S3 with modern var declarations
+        var csvBytes = csvContent.getBytes();
+        var metadata = new ObjectMetadata();
+        metadata.setContentLength(csvBytes.length);
+        metadata.setContentType("text/csv");
+        
+        try (var inputStream = new ByteArrayInputStream(csvBytes)) {
+            s3Client.putObject(bucketName, outputKey, inputStream, metadata);
+            logger.info("Successfully wrote collapsed CSV to: s3://{}/{}", bucketName, outputKey);
+            logger.info("Collapsed CSV contains {} unique expense descriptions", collapsedRecords.size());
+        }
     }
 }

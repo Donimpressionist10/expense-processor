@@ -64,7 +64,7 @@ public class ExpenseProcessor implements RequestHandler<S3Event, String> {
     }
     
     // Java 21 record for collapsed expense data
-    public record CollapsedExpenseRecord(Set<String> valueDates, String description, BigDecimal totalAmount) {
+    public record CollapsedExpenseRecord(Set<String> valueDates, String description, BigDecimal totalAmount, List<ExpenseRecord> sourceRecords) {
         public String[] toArray() {
             // Always use the latest date for simplicity and cleanliness
             var latestDate = valueDates.stream()
@@ -78,20 +78,27 @@ public class ExpenseProcessor implements RequestHandler<S3Event, String> {
             return new CollapsedExpenseRecord(
                     Set.of(record.valueDate()),
                     record.description(),
-                    record.getAmountAsBigDecimal()
+                    record.getAmountAsBigDecimal(),
+                    List.of(record)
             );
         }
         
         public CollapsedExpenseRecord addRecord(ExpenseRecord record) {
             var newDates = new HashSet<>(valueDates);
             newDates.add(record.valueDate());
+            var newSourceRecords = new ArrayList<>(sourceRecords);
+            newSourceRecords.add(record);
             return new CollapsedExpenseRecord(
                     newDates,
                     description,
-                    totalAmount.add(record.getAmountAsBigDecimal())
+                    totalAmount.add(record.getAmountAsBigDecimal()),
+                    newSourceRecords
             );
         }
     }
+    
+    // Java 21 record for filtered record with reason
+    public record FilteredRecord(ExpenseRecord record, String reason) {}
     
     public ExpenseProcessor() {
         this.s3Client = AmazonS3ClientBuilder.defaultClient();
@@ -239,8 +246,8 @@ public class ExpenseProcessor implements RequestHandler<S3Event, String> {
             // Load filter patterns before processing
             loadFilterPatterns(bucketName);
             
-            // Process CSV data using streams and records with filtering
-            var expenseRecords = records.stream()
+            // Parse all records first
+            var allExpenseRecords = records.stream()
                     .skip(1) // Skip header
                     .filter(row -> row.length > Math.max(columnIndices.valueDate(), 
                                                        Math.max(columnIndices.description(), columnIndices.amount())))
@@ -249,20 +256,35 @@ public class ExpenseProcessor implements RequestHandler<S3Event, String> {
                             row[columnIndices.description()],
                             row[columnIndices.amount()]
                     ))
-                    .filter(record -> !shouldFilterRecord(record))
-                    .filter(record -> !hasPositiveAmount(record))
-                    .peek(record -> logger.info("Included CSV row: [{}, {}, {}]", 
-                                               record.valueDate(), record.description(), record.amount()))
                     .toList();
             
+            // Separate records into included and filtered with reasons
+            var includedRecords = new ArrayList<ExpenseRecord>();
+            var filteredRecords = new ArrayList<FilteredRecord>();
+            
+            for (var record : allExpenseRecords) {
+                if (shouldFilterRecord(record)) {
+                    filteredRecords.add(new FilteredRecord(record, "Pattern match: contains filtered term"));
+                } else if (hasPositiveAmount(record)) {
+                    filteredRecords.add(new FilteredRecord(record, "Positive amount: income/refund excluded"));
+                } else {
+                    includedRecords.add(record);
+                    logger.info("Included CSV row: [{}, {}, {}]", 
+                               record.valueDate(), record.description(), record.amount());
+                }
+            }
+            
             logger.info("After filtering: {} records remaining out of {} original records", 
-                       expenseRecords.size(), records.size() - 1);
+                       includedRecords.size(), allExpenseRecords.size());
             
             // Collapse records with same description
-            var collapsedRecords = collapseRecords(expenseRecords);
+            var collapsedRecords = collapseRecords(includedRecords);
             
             // Write collapsed CSV to S3
             writeCollapsedCsvToS3(collapsedRecords, bucketName, originalObjectKey);
+            
+            // Write processing report to S3
+            writeProcessingReportToS3(allExpenseRecords, filteredRecords, collapsedRecords, bucketName, originalObjectKey);
         }
     }
     
@@ -407,7 +429,7 @@ public class ExpenseProcessor implements RequestHandler<S3Event, String> {
                                     .map(ExpenseRecord::getAmountAsBigDecimal)
                                     .reduce(BigDecimal.ZERO, BigDecimal::add);
                             
-                            return new CollapsedExpenseRecord(dates, normalizedDescription, totalAmount);
+                            return new CollapsedExpenseRecord(dates, normalizedDescription, totalAmount, records);
                         }
                 ));
         
@@ -488,5 +510,162 @@ public class ExpenseProcessor implements RequestHandler<S3Event, String> {
             logger.info("Successfully wrote collapsed CSV to: s3://{}/{}", bucketName, outputKey);
             logger.info("Collapsed CSV contains {} unique expense descriptions", collapsedRecords.size());
         }
+    }
+    
+    private void writeProcessingReportToS3(List<ExpenseRecord> allRecords, List<FilteredRecord> filteredRecords, 
+                                          List<CollapsedExpenseRecord> collapsedRecords, String bucketName, String originalObjectKey) throws Exception {
+        logger.info("Writing processing report to S3");
+        
+        var reportContent = generateProcessingReport(allRecords, filteredRecords, collapsedRecords, originalObjectKey);
+        var outputKey = "processed/" + extractFileNameFromKey(originalObjectKey) + "_report.txt";
+        
+        // Upload report to S3
+        var reportBytes = reportContent.getBytes();
+        var metadata = new ObjectMetadata();
+        metadata.setContentLength(reportBytes.length);
+        metadata.setContentType("text/plain");
+        
+        try (var inputStream = new ByteArrayInputStream(reportBytes)) {
+            s3Client.putObject(bucketName, outputKey, inputStream, metadata);
+            logger.info("Successfully wrote processing report to: s3://{}/{}", bucketName, outputKey);
+        }
+    }
+    
+    private String generateProcessingReport(List<ExpenseRecord> allRecords, List<FilteredRecord> filteredRecords, 
+                                          List<CollapsedExpenseRecord> collapsedRecords, String originalObjectKey) {
+        var report = new StringBuilder();
+        var timestamp = java.time.Instant.now().toString();
+        
+        // Header
+        report.append("ExpenseProcessor Processing Report\n");
+        report.append("═".repeat(50)).append("\n");
+        report.append("Generated: ").append(timestamp).append("\n");
+        report.append("Source: ").append(originalObjectKey).append("\n\n");
+        
+        // Summary statistics
+        var totalExpenses = collapsedRecords.stream()
+                .map(CollapsedExpenseRecord::totalAmount)
+                .reduce(BigDecimal.ZERO, BigDecimal::add);
+        
+        var positiveAmountFiltered = filteredRecords.stream()
+                .filter(fr -> fr.reason().contains("Positive amount"))
+                .count();
+        
+        var patternFiltered = filteredRecords.stream()
+                .filter(fr -> fr.reason().contains("Pattern match"))
+                .count();
+        
+        report.append("📊 PROCESSING SUMMARY\n");
+        report.append("═".repeat(50)).append("\n");
+        report.append("Total CSV rows processed: ").append(allRecords.size()).append("\n");
+        report.append("├── ✅ Included in final output: ").append(allRecords.size() - filteredRecords.size())
+               .append(" records → ").append(collapsedRecords.size()).append(" collapsed groups\n");
+        report.append("├── ❌ Filtered out (positive amounts): ").append(positiveAmountFiltered).append(" records\n");
+        report.append("├── ❌ Filtered out (pattern matches): ").append(patternFiltered).append(" records\n");
+        report.append("└── 💰 Total expenses: ").append(totalExpenses.setScale(2, RoundingMode.HALF_UP)).append("\n\n");
+        
+        // Processed records section
+        if (!collapsedRecords.isEmpty()) {
+            report.append("🟢 PROCESSED RECORDS (").append(allRecords.size() - filteredRecords.size())
+                   .append(" → ").append(collapsedRecords.size()).append(" collapsed)\n");
+            report.append("═".repeat(50)).append("\n");
+            
+            for (var collapsed : collapsedRecords) {
+                var sourceCount = collapsed.sourceRecords().size();
+                report.append("├── ").append(collapsed.description())
+                       .append(" (").append(collapsed.totalAmount().setScale(2, RoundingMode.HALF_UP))
+                       .append(") [").append(sourceCount).append(" transaction")
+                       .append(sourceCount > 1 ? "s" : "").append(" collapsed]\n");
+                
+                // Show individual transactions that were collapsed
+                for (int i = 0; i < collapsed.sourceRecords().size(); i++) {
+                    var source = collapsed.sourceRecords().get(i);
+                    var isLast = i == collapsed.sourceRecords().size() - 1;
+                    var prefix = isLast ? "└──" : "├──";
+                    
+                    report.append("│   ").append(prefix).append(" ")
+                           .append(source.valueDate()).append(": ")
+                           .append(source.description()).append(" (")
+                           .append(source.amount()).append(")\n");
+                }
+                report.append("│\n");
+            }
+        }
+        
+        // Filtered records section
+        if (!filteredRecords.isEmpty()) {
+            report.append("\n🔴 FILTERED OUT RECORDS (").append(filteredRecords.size()).append(" total)\n");
+            report.append("═".repeat(50)).append("\n");
+            
+            // Group by reason
+            var positiveRecords = filteredRecords.stream()
+                    .filter(fr -> fr.reason().contains("Positive amount"))
+                    .toList();
+            
+            var patternRecords = filteredRecords.stream()
+                    .filter(fr -> fr.reason().contains("Pattern match"))
+                    .toList();
+            
+            if (!positiveRecords.isEmpty()) {
+                report.append("├── 💵 Positive Amounts (").append(positiveRecords.size()).append(" records excluded)\n");
+                for (var filtered : positiveRecords) {
+                    var record = filtered.record();
+                    report.append("│   ├── ").append(record.valueDate()).append(": ")
+                           .append(record.description()).append(" (").append(record.amount()).append(")\n");
+                }
+                report.append("│\n");
+            }
+            
+            if (!patternRecords.isEmpty()) {
+                report.append("└── 🏷️ Pattern Matches (").append(patternRecords.size()).append(" records excluded)\n");
+                for (var filtered : patternRecords) {
+                    var record = filtered.record();
+                    report.append("    ├── ").append(record.valueDate()).append(": ")
+                           .append(record.description()).append(" (").append(record.amount()).append(")\n");
+                }
+            }
+        }
+        
+        // Statistics section
+        report.append("\n📈 STATISTICS\n");
+        report.append("═".repeat(50)).append("\n");
+        
+        if (!collapsedRecords.isEmpty()) {
+            var largestExpense = collapsedRecords.stream()
+                    .max((r1, r2) -> r1.totalAmount().abs().compareTo(r2.totalAmount().abs()))
+                    .orElse(null);
+            
+            var mostCollapsed = collapsedRecords.stream()
+                    .max((r1, r2) -> Integer.compare(r1.sourceRecords().size(), r2.sourceRecords().size()))
+                    .orElse(null);
+            
+            if (largestExpense != null) {
+                report.append("• Largest expense group: ").append(largestExpense.description())
+                       .append(" (").append(largestExpense.totalAmount().setScale(2, RoundingMode.HALF_UP)).append(")\n");
+            }
+            
+            if (mostCollapsed != null && mostCollapsed.sourceRecords().size() > 1) {
+                report.append("• Most collapsed transactions: ").append(mostCollapsed.description())
+                       .append(" (").append(mostCollapsed.sourceRecords().size()).append(" transactions)\n");
+            }
+            
+            var avgTransaction = totalExpenses.divide(BigDecimal.valueOf(allRecords.size() - filteredRecords.size()), 2, RoundingMode.HALF_UP);
+            report.append("• Average transaction: ").append(avgTransaction).append("\n");
+        }
+        
+        if (allRecords.size() > 0) {
+            var filterEfficiency = (double) filteredRecords.size() / allRecords.size() * 100;
+            report.append("• Filter efficiency: ").append(String.format("%.1f", filterEfficiency)).append("% of records filtered out\n");
+            
+            var originalCount = allRecords.size() - filteredRecords.size();
+            if (originalCount > 0) {
+                var collapseEfficiency = (double) (originalCount - collapsedRecords.size()) / originalCount * 100;
+                report.append("• Collapse efficiency: ").append(String.format("%.1f", collapseEfficiency))
+                       .append("% reduction (").append(originalCount).append("→").append(collapsedRecords.size()).append(" records)\n");
+            }
+        }
+        
+        report.append("\nEnd of Report\n");
+        return report.toString();
     }
 }

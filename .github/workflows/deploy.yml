@@ -49,7 +49,6 @@ jobs:
       uses: aws-actions/setup-sam@v2
       with:
         use-installer: true
-        version: latest
     - name: Cache Gradle packages
       uses: actions/cache@v3
       with:
